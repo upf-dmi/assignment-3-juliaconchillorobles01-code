@@ -1,6 +1,6 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
+title: "Hands_on_III"
+author: "Conchillo Robles, Júlia (julia.conchillorobles01@estudiant.upf.edu)"
 date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
 output:
   html_document:
@@ -10,6 +10,33 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+# Check whether each required package is already installed;if not, install it automatically
+required_packages <- c(
+  "httr",
+  "readxl",
+  "janitor",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "ggplot2",
+  "randomForest",
+  "caret",
+  "pROC",
+  "scales"
+)
+
+# Install only the packages that are not yet available
+missing_packages <- required_packages[
+  !sapply(required_packages, requireNamespace, quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+# Load all packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+  
 ```
 
 # Exercise 1
@@ -27,8 +54,414 @@ Report the following performance metrics from cross-validation:
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
 ```{r}
+# PATIENT METADATA DOWNLOAD and IMPORT
+
+url_mmc1  <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc1.xlsx"
+
+file_mmc1 <- tempfile(fileext = ".xlsx") #Temporay file to store the Excel
+GET(url_mmc1, write_disk(file_mmc1, overwrite = TRUE))
+ 
+raw_data <- read_excel(file_mmc1, sheet = 2, na = c("", "NA", "/"))
 
 ```
+
+```{r}
+# DATA CLEANING 
+
+#Standarize column names
+clean_data <- janitor::clean_names(raw_data, replace = c("\u03bc" = "micro"))
+
+# Convert date columns to proper Date class regardless of their original format
+date_vars <- c("admission_date", "onset_date_f", "date_of_progression_to_severe_state")
+
+clean_data[date_vars] <- lapply(clean_data[date_vars], function(x) {
+  if (inherits(x, "POSIXct") || inherits(x, "POSIXt") || inherits(x, "Date")) {
+    as.Date(x)
+  } else {
+    as.Date(as.character(x))
+  }
+})
+
+#Classification by groups 
+clean_data <- clean_data %>%
+  mutate(
+    group = case_when(
+      group_d == 0 ~ "Healthy Control",
+      group_d == 1 ~ "Non-COVID-19",
+      group_d == 2 ~ "Non-severe",
+      group_d == 3 ~ "Severe",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  filter(group != "Unknown")
+ 
+#Extraction of the needed columns: patient ID and severity for the training cohort
+label_df <- clean_data %>%
+  filter(covid_19_patients_corhort == "Training (C1)") %>% #only tarining cohort
+  filter(group %in% c("Non-severe", "Severe")) %>% #only COVID-19 patients
+  select(Sample = patient_id_a, Severity = group) %>%
+  mutate(Sample = as.character(trimws(Sample)))
+
+#Extraction of the needed columns: patient ID and severity for the test cohort (C2)
+label_df_test <- clean_data %>%
+  filter(covid_19_patients_corhort == "Test 1 (C2)") %>% #only test 1 cohort
+  filter(group %in% c("Non-severe", "Severe")) %>% #only COVID-19 patients
+  select(Sample = patient_id_a, Severity = group) %>%
+  mutate(Sample = as.character(trimws(Sample)))
+
+#Check class distribution in each cohort
+print(label_df)
+print(table(label_df$Severity))
+ 
+print(label_df_test)
+print(table(label_df_test$Severity))
+ 
+```
+
+```{r}
+# TRAINING COHORT (Supplementary Table 3)
+
+ 
+url_mmc3  <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc3.xlsx"
+file_mmc3 <- tempfile(fileext = ".xlsx")
+GET(url_mmc3, write_disk(file_mmc3, overwrite = TRUE))
+
+#Read the protein/metabolite matrix sheet
+df_raw <- read_excel(file_mmc3,
+                     sheet     = "Prot_and_meta_matrix",
+                     col_names = TRUE,
+                     na        = c("", "NA", "#N/D")) 
+
+cat(nrow(df_raw), ncol(df_raw)) #dimentions
+
+```
+
+```{r}
+# DATA CLEANING (supplemetary table 3)
+
+#The first row conatins the patients IDs 
+sample_ids <- as.character(df_raw[1, 3:ncol(df_raw)])
+sample_ids <- trimws(sample_ids[!is.na(sample_ids)])
+
+#All remaining rows are protein features
+df_prot <- df_raw[2:nrow(df_raw), ]
+
+#Features names: We use Gene Symbol (col 2), but if it says NA, we use Protein ID (col 1)
+gene_names <- ifelse(
+  is.na(df_prot[[2]]) | trimws(as.character(df_prot[[2]])) %in% c("NA", ""),
+  as.character(df_prot[[1]]),
+  as.character(df_prot[[2]])
+)
+
+# We keep only the first Gene Symbol name
+gene_names <- sapply(strsplit(gene_names, ","), `[`, 1)
+gene_names <- trimws(gene_names)
+gene_names <- make.unique(gene_names, sep = "_")
+
+#Numeric matrix: features x samples
+mat_prot           <- apply(df_prot[, 3:(2 + length(sample_ids))], 2, as.numeric)
+rownames(mat_prot) <- gene_names
+colnames(mat_prot) <- sample_ids
+ 
+#Transpose the matrix to have it in ML format (samples x features)
+X_all <- as.data.frame(t(mat_prot))
+ 
+cat(nrow(X_all), "samples x", ncol(X_all), "features\n")
+ 
+```
+
+```{r}
+# JOIN (proteomics with severity)
+
+
+#Adding sample column to do the join
+X_all$Sample <- rownames(X_all)
+
+#Inner join keeps only patients present in both the expression matrix and the label table
+df_model <- X_all %>%
+  inner_join(label_df, by = "Sample")
+
+#Encode severity as a factor with "Non-severe" as the reference level
+df_model$Severity <- factor(df_model$Severity,
+                            levels = c("Non-severe", "Severe"))
+
+#Separate predictors (X) from the response variable (y)
+X <- df_model %>% select(-Sample, -Severity)
+y <- df_model$Severity
+
+cat("Training cohort used for ML:", nrow(X), "samples x", ncol(X), "features\n")
+table(y)
+```
+
+```{r}
+# HYPERPARAMETER TUNING: mtry via 5-fold Stratified CV
+
+
+# mtry controls how many features are randomly considered at each tree split.
+# We evaluate a small grid and pick the value that maximises cross-validated AUC.
+
+set.seed(42) #ensures reproducibility
+
+p <- ncol(X)
+
+#We use these candidate mtry values
+mtry_grid <- unique(c(
+  5,
+  10,
+  20,
+  floor(sqrt(p))
+))
+
+mtry_grid <- mtry_grid[mtry_grid > 0 & mtry_grid <= p]
+
+# Create 5 stratified folds
+folds <- createFolds(y, k = 5, returnTrain = FALSE)
+
+results <- data.frame(mtry = integer(), AUC = numeric())
+
+for (m in mtry_grid) {
+  
+  cat("Testing mtry =", m, "\n")
+  
+  fold_probs <- list() #Stores predicted probabilities per fold
+  fold_true  <- list() #Stores true labels per fold
+  
+  for (i in seq_along(folds)) {
+    
+    idx_test  <- folds[[i]]
+    idx_train <- setdiff(seq_len(nrow(X)), idx_test)
+    
+    X_train <- X[idx_train, , drop = FALSE]
+    X_test  <- X[idx_test, , drop = FALSE]
+    y_train <- y[idx_train]
+    y_test  <- y[idx_test]
+    
+
+#Preprocessing within fold to avoid data leakage
+    
+#keep proteins observed in at least 80% of training samples
+  prot_keep <- colSums(!is.na(X_train)) >= 0.8 * nrow(X_train)
+  X_train <- X_train[, prot_keep, drop = FALSE]
+  X_test  <- X_test[, prot_keep, drop = FALSE]
+    
+#median imputation 
+  train_medians <- sapply(X_train, median, na.rm = TRUE)
+    
+  for (j in seq_along(train_medians)) {
+    X_train[is.na(X_train[, j]), j] <- train_medians[j]
+    X_test[is.na(X_test[, j]), j]   <- train_medians[j]
+  }
+
+#train the RF on this fold's training split
+rf <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 500,
+  mtry = m,
+  importance = TRUE
+)
+
+#predict probability of "Severe" class
+probs <- predict(rf, X_test, type = "prob")[, "Severe"]
+    
+  fold_probs[[i]] <- probs
+  fold_true[[i]]  <- y_test
+  }
+  
+#Pool predictions across all folds and compute AUC
+all_probs <- unlist(fold_probs)
+all_true  <- factor(unlist(fold_true), levels = levels(y))
+  
+roc_obj <- roc(all_true, all_probs,
+  levels = c("Non-severe", "Severe"),
+  direction = "<",
+  quiet = TRUE)
+  
+results <- rbind(results,
+  data.frame(mtry = m, AUC = as.numeric(auc(roc_obj))))
+}
+
+print(results)
+
+#Plot AUC vs mtry to visualise the tuning
+ggplot(results, aes(x = mtry, y = AUC)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Hyperparameter tuning (mtry)",
+       x = "mtry",
+       y = "Cross-validated AUC")
+
+#Select the mtry value with the highest AUC
+best_mtry <- results$mtry[which.max(results$AUC)]
+best_mtry
+```
+
+```{r}
+# FINAL 5-FOLD CV WITH BEST mtry
+
+
+#Re-run the full cross-validation using the selected mtry 
+
+set.seed(42)
+
+folds <- createFolds(y, k = 5, returnTrain = FALSE)
+
+lista_preds <- list() #Class predictions per fold
+lista_probs <- list() #Probability of "Severe" per fold
+lista_true  <- list() #True labels per fold
+
+for (i in seq_along(folds)) {
+  
+  idx_test  <- folds[[i]]
+  idx_train <- setdiff(seq_len(nrow(X)), idx_test)
+  
+  X_train <- X[idx_train, , drop = FALSE]
+  X_test  <- X[idx_test, , drop = FALSE]
+  y_train <- y[idx_train]
+  y_test  <- y[idx_test]
+  
+#Preprocessing within fold
+prot_keep <- colSums(!is.na(X_train)) >= 0.8 * nrow(X_train)
+X_train <- X_train[, prot_keep, drop = FALSE]
+X_test  <- X_test[, prot_keep, drop = FALSE]
+  
+train_medians <- sapply(X_train, median, na.rm = TRUE)
+  
+for (j in seq_along(train_medians)) {
+  X_train[is.na(X_train[, j]), j] <- train_medians[j]
+  X_test[is.na(X_test[, j]), j]   <- train_medians[j]
+}
+  
+rf_cv <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 500,
+  mtry = best_mtry
+)
+  
+lista_preds[[i]] <- predict(rf_cv, X_test, type = "response")
+lista_probs[[i]] <- predict(rf_cv, X_test, type = "prob")[, "Severe"]
+lista_true[[i]]  <- y_test
+}
+
+#Concatenate results across all folds
+all_preds <- factor(unlist(lista_preds), levels = levels(y))
+all_probs <- unlist(lista_probs)
+all_true  <- factor(unlist(lista_true), levels = levels(y))
+```
+
+```{r}
+# EVALUATION METRICS
+
+
+#Confusion matrix using "Severe" as the positive class
+cm <- confusionMatrix(all_preds, all_true, positive = "Severe")
+print(cm)
+
+#Compute ROC curve and AUC 
+roc_obj <- roc(all_true, all_probs,
+               levels = c("Non-severe", "Severe"),
+               direction = "<",
+               quiet = TRUE)
+
+roc_auc <- auc(roc_obj)
+
+#Extract individual metrics for reporting
+accuracy    <- unname(cm$overall["Accuracy"])
+sensitivity <- unname(cm$byClass["Sensitivity"])
+specificity <- unname(cm$byClass["Specificity"])
+precision   <- unname(cm$byClass["Pos Pred Value"])
+f1          <- unname(cm$byClass["F1"])
+
+cat("Accuracy   :", round(accuracy, 3), "\n")
+cat("Sensitivity:", round(sensitivity, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("Precision  :", round(precision, 3), "\n")
+cat("F1         :", round(f1, 3), "\n")
+cat("AUC        :", round(as.numeric(roc_auc), 3), "\n")
+```
+
+```{r}
+# RESULTS VISUALIZATION
+
+
+#Confusion Matrix 
+as.data.frame(cm$table) %>%
+  rename(Predicho = Prediction, Real = Reference, N = Freq) %>%
+  ggplot(aes(x = Predicho, y = Real, fill = N)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = N), size = 12, fontface = "bold", color = "white") +
+  scale_fill_gradient(low = "#90CAF9", high = "#1565C0") +
+  labs(
+    title    = "Confusion Matrix — Random Forest (5-fold CV)",
+    subtitle = sprintf("Accuracy = %.3f  |  Sensitivity = %.3f  |  Specificity = %.3f",
+                       accuracy, sensitivity, specificity),
+    x = "Predicted", y = "Real"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 12, face = "bold"))
+
+#ROC curve
+data.frame(
+  FPR = 1 - roc_obj$specificities,
+  TPR = roc_obj$sensitivities
+) %>%
+  ggplot(aes(x = FPR, y = TPR)) +
+  geom_line(color = "#1565C0", linewidth = 1.4) +
+  geom_ribbon(aes(ymin = 0, ymax = TPR), fill = "#1565C0", alpha = 0.10) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  annotate("label", x = 0.65, y = 0.12,
+           label   = sprintf("AUC = %.3f", roc_auc),
+           size    = 5.5, color = "#1565C0", fontface = "bold",
+           fill    = "white", label.size = 0.5) +
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title    = "ROC Curve — Random Forest (5-fold CV)",
+    subtitle = "COVID-19 Severity: Severe vs Non-severe",
+    x = "False Positive Rate (1 − Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 13)
+ 
+
+```
+
+```{r}
+# FINAL MODEL TRAINED ON FULL TRAINING COHORT
+
+
+#After CV evaluation, we retrain on ALL of C1 using best_mtry.
+#This model is used for external prediction in Exercise 3.
+
+#Apply the same preprocessing rules learned from the full training set
+final_keep <- colSums(!is.na(X)) >= 0.8 * nrow(X)
+X_final <- X[, final_keep, drop = FALSE]
+
+#Compute and apply median imputation on the full training set
+final_medians <- sapply(X_final, median, na.rm = TRUE)
+
+for (j in seq_along(final_medians)) {
+  X_final[is.na(X_final[, j]), j] <- final_medians[j]
+}
+
+#Train the final Random Forest on the complete C1 cohort
+rf_final <- randomForest(
+  x = X_final,
+  y = y,
+  ntree = 500,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+cat("Final model trained with", ncol(X_final), "proteins and mtry =", best_mtry, "\n")
+```
+
+**How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?**
+The Random Forest model exhibits strong predictive performance, achieving an overall accuracy of approximately 84% across 31 patients. For non-severe cases (n = 18), the model demonstrates high precision (88%), correctly predicting most non-severe outcomes, with only 2 misclassifications. For severe cases (n = 13), the model attains a precision of 73%, successfully identifying a substantial portion of severe cases. The model’s ability to distinguish between non-severe and severe patients is further highlighted by an AUC-ROC of 0.904, indicating excellent discriminative performance. Overall, the model shows balanced performance across both severity levels, effectively separating patients based on their proteomic profiles. However, the small sample size substantially limits the reliability of these metrics and the model’s ability to generalize to larger populations.
 
 # Exercise 2
 
@@ -39,8 +472,76 @@ Using the trained Random Forest model from Exercise 1, identify the 25 most impo
 Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
 
 ```{r}
+# FEATURE IMPORTANCE 
+
+
+#Extract Mean Decrease Gini from the final model
+imp_df <- importance(rf_final, type = 2) %>%
+  as.data.frame() %>%
+  rownames_to_column("Proteina") %>%
+  rename(Importancia = MeanDecreaseGini) %>%
+  arrange(desc(Importancia)) #Sort from most to least important (higher value = greater contribution to node classification)
+
+#Keep the top 25 proteins
+top25_imp <- imp_df %>% slice_head(n = 25)
+
+print(top25_imp)
+
+ggplot(top25_imp, aes(x = reorder(Proteina, Importancia), y = Importancia)) +
+  geom_col(fill = "#4CAF50", width = 0.7) +
+  coord_flip() +
+  labs(
+    title    = "Top 25 features — Random Forest Feature Importance",
+    x = NULL,
+    y = "Mean Decrease Gini"
+  ) +
+  theme_minimal(base_size = 12)
 
 ```
+The Random Forest model highlighted a set of proteins whose importance aligns closely with known pathophysiology of severe COVID-19. Among the top features, CRP, SAA1, and SAA2 stand out as classical acute-phase reactants that are robustly upregulated during systemic inflammation, consistent with the cytokine storm observed in severe disease. Components of the terminal complement cascade — C6 and C9 — were also highly ranked, supporting the hypothesis that uncontrolled complement activation contributes to tissue damage and respiratory failure in critical patients. Several serine protease inhibitors, including SERPING1, SERPINA3, and SERPINA10, appeared among the top features, reflecting dysregulation of both the coagulation and innate immune systems, two hallmarks of severe COVID-19. Finally, proteins such as ALB, LRG1, and LBP point to broad systemic inflammatory signalling and immune dysregulation as key discriminators between severe and non-severe cases.
+
+```{r}
+# LOAD SUPPLEMENTARY TABLE 5
+
+
+url_mmc5  <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc5.xlsx"
+file_mmc5 <- tempfile(fileext = ".xlsx")
+GET(url_mmc5, write_disk(file_mmc5, overwrite = TRUE))
+
+df_raw5 <- read_excel(file_mmc5,
+                     sheet     = "Prot_and_meta_matrix",
+                     col_names = TRUE,
+                     na        = c("", "NA", "#N/D")) 
+
+cat(nrow(df_raw5), ncol(df_raw5)) #dimensions
+
+```
+
+```{r}
+# COMPARISON WITH PAPER'S SUPPLEMENTARY TABLE 5
+
+#Extract the list of proteins reported as important by the original authors
+paper_proteins <- df_raw5 %>%
+  filter(!is.na("Gene Symbol")) %>%
+  pull("Gene Symbol") %>%
+  as.character() %>%
+  trimws() %>%
+  unique()
+
+#Our top 25 proteins from the RF model
+rf_proteins <- top25_imp$Proteina %>%
+  as.character() %>%
+  trimws()
+
+#Find proteins present in both lists
+common_proteins <- intersect(rf_proteins, paper_proteins)
+
+cat("\nProteins in common with the paper's top features:\n")
+print(common_proteins)
+cat("Number of overlapping proteins:", length(common_proteins), "\n")
+
+```
+The overlap between the Random Forest's top 25 features and the proteins reported in Supplementary Table 5 of the original publication confirms that the model is capturing biologically meaningful signals rather than noise. The shared proteins reinforce the central role of acute-phase response, complement activation, and coagulation dysregulation in COVID-19 severity, and demonstrate that data-driven feature selection can converge on the same markers identified through the authors' statistical framework.
 
 # Exercise 3
 
@@ -59,8 +560,161 @@ Your task is to:
 How does the model perform on the independent test cohort?
 
 ```{r}
+# TEST COHORT (Supplementary Table 4)
+
+
+url_mmc4  <- "https://ars.els-cdn.com/content/image/1-s2.0-S0092867420306279-mmc4.xlsx"
+file_mmc4 <- tempfile(fileext = ".xlsx")
+GET(url_mmc4, write_disk(file_mmc4, overwrite = TRUE))
+
+df_test_raw <- read_excel(file_mmc4,
+                          sheet = "Prot_and_meta_matrix",
+                          col_names = TRUE,
+                          na = c("", "NA", "#N/D"))
+
+cat(nrow(df_test_raw), ncol(df_test_raw), "\n")
+
 
 ```
+
+```{r}
+# CLEANING SUPPLEMENTARY TABLE 4 AND COMPARING
+
+
+#The first row conatins the patients IDs 
+sample_ids_4 <- as.character(df_test_raw[1, 3:ncol(df_test_raw)])
+sample_ids_4 <- trimws(sample_ids_4[!is.na(sample_ids_4)])
+
+#Protein rows (from 2 to the end)
+df_prot_4 <- df_test_raw[2:nrow(df_test_raw), ]
+
+#Features names: We use Gene Symbol (col 2), but if it says NA, we use Protein ID (col 1)
+gene_names_4 <- ifelse(
+  is.na(df_prot_4[[2]]) | trimws(as.character(df_prot_4[[2]])) %in% c("NA", ""),
+  as.character(df_prot_4[[1]]),
+  as.character(df_prot_4[[2]])
+)
+
+#We keep only the first Gene Symbol name
+gene_names_4 <- sapply(strsplit(gene_names_4, ","), `[`, 1)
+gene_names_4 <- trimws(gene_names_4)
+gene_names_4 <- make.unique(gene_names_4, sep = "_")
+
+#Numeric matrix : features x samples
+mat_prot_4           <- apply(df_prot_4[, 3:(2 + length(sample_ids_4))], 2, as.numeric)
+rownames(mat_prot_4) <- gene_names_4
+colnames(mat_prot_4) <- sample_ids_4
+ 
+#Transpose the matrix to have it in ML format (samples x features)
+X_all_4 <- as.data.frame(t(mat_prot_4))
+ 
+cat(nrow(X_all_4), "samples x", ncol(X_all_4), "features\n")
+
+X_all_4$Sample <- rownames(X_all_4)
+ 
+```
+
+```{r}
+#JOIN (proteomics with severity)
+
+
+df_model_4 <- X_all_4 %>%
+  inner_join(label_df_test, by = "Sample")
+
+#Encode severity with the same factor levels used during training
+df_model_4$Severity <- factor(df_model_4$Severity,
+                            levels = c("Non-severe", "Severe"))
+
+#Separate predictors and true labels for evaluation
+X_test_external <- df_model_4 %>% select(-Sample, -Severity)
+
+y_test <- df_model_4$Severity
+y_test <- factor(y_test, levels = c("Non-severe", "Severe"))
+
+#Report correct dimensions of the test set
+cat("Test cohort used for evaluation:", nrow(X_test_external), "samples x", ncol(X_test_external), "features\n")
+table(y_test)
+```
+```{r}
+# ALIGN TEST FEATURES WITH TRAINING FEATURES
+
+
+#Identify features in the final model that are absent from the test set
+missing_features <- setdiff(colnames(X_final), colnames(X_test_external))
+
+#Add missing columns filled with NA
+for (feat in missing_features) {
+  X_test_external[[feat]] <- NA_real_
+}
+
+#Reorder columns to match training set exactly
+X_test_external <- X_test_external[, colnames(X_final)]
+
+for (j in seq_along(final_medians)) {
+  X_test_external[is.na(X_test_external[, j]), j] <- final_medians[j]
+}
+
+#Generate predictions on the aligned test set
+test_probs <- predict(rf_final, X_test_external, type = "prob")[, "Severe"]
+test_preds <- predict(rf_final, X_test_external, type = "response")
+
+#Collect results
+results_test <- data.frame(
+  Sample = df_model_4$Sample,
+  Real = y_test,
+  Predicted = test_preds,
+  Prob_Severe = test_probs
+)
+
+print(results_test)
+```
+
+```{r}
+# EXTERNAL TEST EVALUATION
+
+cm_test <- confusionMatrix(test_preds, y_test, positive = "Severe")
+print(cm_test)
+
+#ROC curve and AUC on the external test cohort
+roc_test <- roc(y_test, test_probs,
+                levels = c("Non-severe", "Severe"),
+                direction = "<")
+
+auc_test <- auc(roc_test)
+
+cat("Test Accuracy:", round(cm_test$overall["Accuracy"], 3), "\n")
+cat("Test AUC:", round(as.numeric(auc_test), 3), "\n")
+```
+
+```{r}
+#CONFUSION MATRIX VISUALIZATION
+
+accuracy_test    <- unname(cm_test$overall["Accuracy"])
+sensitivity_test <- unname(cm_test$byClass["Sensitivity"])
+specificity_test <- unname(cm_test$byClass["Specificity"])
+
+as.data.frame(cm_test$table) %>%
+  rename(Predicho = Prediction, Real = Reference, N = Freq) %>%
+  ggplot(aes(x = Predicho, y = Real, fill = N)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = N), size = 12, fontface = "bold", color = "white") +
+  scale_fill_gradient(low = "#90CAF9", high = "#1565C0") +
+  labs(
+    title    = "Confusion Matrix — Random Forest (External Test Set)",
+    subtitle = sprintf("Accuracy = %.3f  |  Sensitivity = %.3f  |  Specificity = %.3f",
+                       accuracy_test, sensitivity_test, specificity_test),
+    x = "Predicted", y = "Real"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(size = 12, face = "bold")
+  )
+```
+
+**How does the model perform on the independent test cohort?**
+
+The model demonstrates strong predictive performance, achieving 90% overall accuracy across 10 cases. For non-severe cases (n = 6), the model attains high precision (83%), indicating that when it predicts non-severe outcomes, it is correct most of the time, although it misclassifies one-sixth of actual non-severe cases as severe. For severe cases (n = 4), the model achieves perfect precision and recall (100%), correctly identifying all severe cases. Overall, both classes show balanced performance across severity levels. The model exhibits a slight bias toward predicting severe outcomes, which may be clinically appropriate, as it ensures no severe cases are missed, albeit at the cost of some false positives. However, the small sample size substantially limits the reliability of these metrics and the model’s ability to generalize to larger populations.
 
 # session info {.unnumbered}
 
